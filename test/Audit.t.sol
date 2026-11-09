@@ -1120,9 +1120,8 @@ contract FakeStrategy is IStrategy {
 
                 /// @notice `_sharesForFee` must not divide by zero when the vault has no supply and no assets.
                 function test_Safe_SharesForFeeNoDivideByZero() public {
-                    ERC4626Vault empty = new ERC4626Vault(
-                        IERC20(address(asset)), address(this), LIMIT, FEE, feeRecipient
-                    );
+                    IERC20 underlying = IERC20(address(asset));
+                    ERC4626Vault empty = new ERC4626Vault(underlying, address(this), LIMIT, FEE, feeRecipient);
                     FakeStrategy fake = new FakeStrategy(address(asset), address(empty));
                     empty.setStrategy(address(fake));
 
