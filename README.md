@@ -131,26 +131,31 @@ npm run dev:all      # anvil:8546 → deploy → vite:5174
 一条命令 `forge test` 的真实输出：
 
 ```
-Ran 3 test suites in 2.26s: 86 tests passed, 0 failed, 0 skipped (86 total tests)
+Ran 3 test suites in 5.88s: 89 tests passed, 0 failed, 0 skipped (89 total tests)
 ```
 
 | 套件 | 用例数 | 结果 |
 | --- | --- | --- |
 | `test/ERC4626Vault.t.sol` | 55 | 全部通过（含 3 个 fuzz，每个 512 runs） |
 | `test/Strategy.t.sol` | 27 | 全部通过 |
-| `test/Invariant.t.sol` | 4 | 全部通过（每个 128 runs × 4096 calls，0 reverts） |
-| **合计** | **86** | **100% 通过** |
+| `test/Invariant.t.sol` | 7 | 全部通过（每个 128 runs × 4096 calls，0 reverts） |
+| **合计** | **89** | **100% 通过** |
 
 不变量测试的不变量清单：
 
-| 不变量 | 断言 |
-| --- | --- |
-| `invariant_TotalAssetsEqualsIdlePlusDebt` | 任何时候 `totalAssets() == totalIdle + totalDebt` |
-| `invariant_VaultNeverInsolvent` | `totalAssets() >= totalDebt`，且 `totalDebt <= strategy.totalAssets()` |
-| `invariant_SharesNeverWorthLessThanDeposited` | 无模拟亏损时，全部在外流通份额可兑换的资产 ≥ handler 记录的净本金 |
-| `invariant_SupplyNeverZeroWithAssets` | 金库持有资产时 `totalSupply() > 0` |
+| 不变量 | 断言 | 为什么这样写 |
+| --- | --- | --- |
+| `invariant_TotalAssetsEqualsIdlePlusDebt` | 任何时候 `totalAssets() == totalIdle + totalDebt` | 精确等式，无容差 |
+| `invariant_VaultNeverInsolvent` | `totalAssets() >= totalDebt`，且无模拟亏损时 `totalDebt <= strategy.totalAssets()` | 模拟亏损后到下次 harvest 之间，名义债务合法地高于实际资产——这正是 report 机制存在的意义，所以该分支在亏损后跳过 |
+| `invariant_HandlerShareLedgerMatchesVault` | handler 记录的份额总数 == 三个 actor 在金库中的真实余额之和 | 份额是整数，金库要么报对要么报错，任何偏差都是 bug，因此零容差 |
+| `invariant_SharePriceNeverDrops` | 无模拟亏损时，`convertToAssets(1e18)` 不低于历史峰值 | 存款向下取整份额、取款向下取整资产、盈利 harvest 抬价，三者都不会让价格下跌 |
+| `invariant_WithdrawalsNeverExceedInflows` | 累计提取 ≤ 累计存入 + 注入的模拟收益 | 把 yield 计入流入，才不是一句「没利息时成立」的空话 |
+| `invariant_SupplyNeverZeroWithAssets` | 金库持有资产时 `totalSupply() > 0` | 防「1 wei 接管整个池子」 |
+| `invariant_DeadSharesNeverBurned` | `0xdEaD` 余额恒 ≥ `DEAD_SHARES` | 死份额是通胀防御的最后一层，被烧掉就失效了 |
 
 `VaultHandler` 暴露的动作：`deposit` / `mint` / `withdraw` / `redeem` / `harvest` / `simulateYield` / `simulateLoss` / `warp`，actor 限定为 alice/bob/carol 三人，每个动作内部 `bound` 参数并 try/catch 掉合法 revert，因此 4096 次调用中 0 revert，全部是有效状态转移。
+
+**关于 ghost 记账的一个设计决定**：handler 用**份额**而非资产做账。ERC-4626 强制存款向下取整份额、取款向下取整资产，每次操作最多会让用户少得 1 wei 的价值；在 `_decimalsOffset() = 3` 下这 1 wei 份额最多值 1e15 asset-wei。若用资产记账，容差必须开到 1e15 量级，那样的断言实际上什么都测不到。份额计数是精确的，所以零容差反而更有检测力。
 
 ---
 
@@ -166,11 +171,12 @@ Ran 3 test suites in 2.26s: 86 tests passed, 0 failed, 0 skipped (86 total tests
 | `src/mocks/MockERC20.sol` | 100.00% (9/9) | 83.33% (5/6) | 0.00% (0/1) | 100.00% (4/4) |
 | `src/mocks/MockLendingPool.sol` | 100.00% (48/48) | 80.36% (45/56) | 15.38% (2/13) | 100.00% (7/7) |
 | `test/BaseTest.sol` | 100.00% (29/29) | 100.00% (26/26) | 100.00% (0/0) | 100.00% (5/5) |
-| `test/Invariant.t.sol` | 86.15% (56/65) | 87.14% (61/70) | 83.33% (10/12) | 83.33% (10/12) |
+| `test/Invariant.t.sol` | 92.86% (65/70) | 91.14% (72/79) | 84.62% (11/13) | 83.33% (10/12) |
 | `script/Deploy.s.sol` | 0.00% (0/47) | 0.00% (0/53) | 0.00% (0/2) | 0.00% (0/2) |
-| **Total** | **84.44% (407/482)** | **80.99% (473/584)** | **61.80% (55/89)** | **94.94% (75/79)** |
+| **Total** | **85.60% (416/486)** | **81.90% (484/591)** | **63.64% (56/88)** | **94.94% (75/79)** |
 
 核心合约（`src/` 下非 mock）行覆盖率：**93.3%（265/284）**，函数覆盖率 **100%（49/49）**。
+全仓（含 mock、script、test）行覆盖率 **85.60%（416/486）**。
 `Deploy.s.sol` 不计入单测覆盖，它由 `forge script` 的 dry run 与真实广播验证（广播 gas：6,576,753）。
 
 未覆盖的行集中在两类：`require` 守卫的不可达分支（例如 `_decimalsOffset` 与 asset 小数位组合下的溢出保护），以及 `sweep` 的异常路径。这些分支靠人工审查而非测试覆盖来保证，README 的「已知取舍」章节对此有说明。

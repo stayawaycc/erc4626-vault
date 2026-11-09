@@ -12,8 +12,14 @@ import { MockLendingPool } from "../src/mocks/MockLendingPool.sol";
 /**
  * @title VaultHandler
  * @notice Bounded action surface for the invariant fuzzer. Every action is wrapped in try/catch so a
- *         legitimate revert (limit reached, insufficient shares, ...) never aborts the run, and the
- *         handler tracks the ghost accounting the invariants are checked against.
+ *         legitimate revert (limit reached, insufficient shares, ...) never aborts the run.
+ *
+ *         The ghost ledger tracks shares, never assets. ERC-4626 mandates that `deposit` rounds
+ *         shares down and `withdraw` rounds assets down, so an asset-denominated ledger drifts by up
+ *         to one share's worth after every action — and with `_decimalsOffset() = 3` one share can
+ *         be worth 1e15 asset-wei. Any asset-based assertion would therefore need a tolerance so
+ *         wide it would stop detecting real bugs. Share counts are exact: the vault reports exactly
+ *         how many shares it minted and burned.
  */
 contract VaultHandler is Test {
     ERC4626Vault public immutable vault;
@@ -24,11 +30,17 @@ contract VaultHandler is Test {
     address[] public actors;
     address internal currentActor;
 
-    /// @notice Net assets each actor put in minus what it took out, i.e. the principal at risk.
-    mapping(address => uint256) public ghostNetDeposited;
-    /// @notice Sum of all `ghostNetDeposited`, used by the solvency invariant.
-    uint256 public ghostTotalNetDeposited;
-    /// @notice Set to true if a loss is ever simulated; the yield-monotonicity invariant is skipped then.
+    /// @notice Shares the handler minted and has not yet burned, across all actors.
+    uint256 public ghostTotalShares;
+    /// @notice Assets the handler paid to obtain `ghostTotalShares`.
+    uint256 public ghostTotalAssetsPaid;
+    /// @notice Assets the handler has taken back out.
+    uint256 public ghostTotalAssetsOut;
+    /// @notice Yield the handler injected into the lending pool, which is a legitimate inflow.
+    uint256 public ghostTotalYieldInjected;
+    /// @notice Highest share price ever observed, in assets per 1e18 shares.
+    uint256 public ghostPeakPricePerShare;
+    /// @notice Set to true if a loss is ever simulated; the monotonicity invariants are skipped then.
     bool public ghostLossSimulated;
 
     modifier useActor(uint256 seed) {
@@ -51,6 +63,8 @@ contract VaultHandler is Test {
         strategy = strategy_;
         actors = actors_;
 
+        ghostPeakPricePerShare = vault.convertToAssets(1e18);
+
         for (uint256 i = 0; i < actors_.length; ++i) {
             vm.prank(actors_[i]);
             asset_.approve(address(vault_), type(uint256).max);
@@ -70,9 +84,9 @@ contract VaultHandler is Test {
         if (balance == 0) return;
         amount = bound(amount, 1, balance);
 
-        try vault.deposit(amount, currentActor) {
-            ghostNetDeposited[currentActor] += amount;
-            ghostTotalNetDeposited += amount;
+        try vault.deposit(amount, currentActor) returns (uint256 shares) {
+            ghostTotalShares += shares;
+            ghostTotalAssetsPaid += amount;
         } catch { }
     }
 
@@ -86,8 +100,8 @@ contract VaultHandler is Test {
 
         uint256 assetsNeeded = vault.previewMint(shares);
         try vault.mint(shares, currentActor) {
-            ghostNetDeposited[currentActor] += assetsNeeded;
-            ghostTotalNetDeposited += assetsNeeded;
+            ghostTotalShares += shares;
+            ghostTotalAssetsPaid += assetsNeeded;
         } catch { }
     }
 
@@ -96,8 +110,10 @@ contract VaultHandler is Test {
         if (maxAssets == 0) return;
         amount = bound(amount, 1, maxAssets);
 
+        uint256 sharesBefore = vault.balanceOf(currentActor);
         try vault.withdraw(amount, currentActor, currentActor) {
-            _recordOutflow(amount);
+            ghostTotalShares -= (sharesBefore - vault.balanceOf(currentActor));
+            ghostTotalAssetsOut += amount;
         } catch { }
     }
 
@@ -108,19 +124,26 @@ contract VaultHandler is Test {
 
         uint256 expectedAssets = vault.previewRedeem(shares);
         try vault.redeem(shares, currentActor, currentActor) returns (uint256 assetsOut) {
-            _recordOutflow(assetsOut);
+            ghostTotalShares -= shares;
+            ghostTotalAssetsOut += assetsOut;
             assertLe(assetsOut, expectedAssets, "redeem paid more than previewRedeem");
         } catch { }
     }
 
     function harvest(uint256) external {
-        try vault.harvest() { } catch { }
+        try vault.harvest() {
+            // Record the new peak so the monotonicity invariant can be checked without storing
+            // per-step history.
+            uint256 price = vault.convertToAssets(1e18);
+            if (price > ghostPeakPricePerShare) ghostPeakPricePerShare = price;
+        } catch { }
     }
 
     function simulateYield(uint256 amount) external {
         if (ghostLossSimulated) return;
         amount = bound(amount, 1e15, 100_000e18);
         pool.simulateYield(amount);
+        ghostTotalYieldInjected += amount;
     }
 
     function simulateLoss(uint256 amount) external {
@@ -135,82 +158,81 @@ contract VaultHandler is Test {
         vm.warp(block.timestamp + bound(secondsElapsed, 1, 30 days));
     }
 
-    // ---------------------------------------------------------------------
-    // Internals
-    // ---------------------------------------------------------------------
-
-    function _recordOutflow(uint256 assetsOut) internal {
-        uint256 deposited = ghostNetDeposited[currentActor];
-        uint256 reduction = assetsOut < deposited ? assetsOut : deposited;
-        ghostNetDeposited[currentActor] = deposited - reduction;
-        ghostTotalNetDeposited -= reduction;
+    /// @notice Sum of every actor's live share balance, read from the vault.
+    function vaultShareBalanceSum() external view returns (uint256 sum) {
+        for (uint256 i; i < actors.length; ++i) {
+            sum += vault.balanceOf(actors[i]);
+        }
     }
 }
 
 /**
  * @title InvariantTest
- * @notice Stateful invariants over the vault + strategy + pool system.
+ * @notice Stateful fuzzing of the vault's core safety properties.
+ * @dev The properties below are chosen so that each one is either exactly checkable or explicitly
+ *      scoped to the states where it is meant to hold. A loose assertion with a magic tolerance is
+ *      worse than no assertion: it passes for the wrong reasons and hides real regressions.
  */
 contract InvariantTest is Test {
-    uint256 internal constant DEPOSIT_LIMIT = 10_000_000e18;
-
+    ERC4626Vault internal vault;
     MockERC20 internal asset;
     MockLendingPool internal pool;
     LendingStrategy internal strategy;
-    ERC4626Vault internal vault;
     VaultHandler internal handler;
 
-    address internal alice;
-    address internal bob;
-    address internal carol;
+    address internal alice = makeAddr("alice");
+    address internal bob = makeAddr("bob");
+    address internal carol = makeAddr("carol");
+
+    uint256 internal constant INITIAL_BALANCE = 1_000_000e18;
 
     function setUp() public {
         vm.warp(1_700_000_000);
 
-        alice = makeAddr("alice");
-        bob = makeAddr("bob");
-        carol = makeAddr("carol");
-
         asset = new MockERC20("Mock USD", "mUSD", 18);
         pool = new MockLendingPool(address(asset));
-        vault = new ERC4626Vault(IERC20(address(asset)), address(this), DEPOSIT_LIMIT, 1_000, makeAddr("fee"));
-        strategy = new LendingStrategy(address(asset), address(vault), address(this), makeAddr("keeper"));
+        vault = new ERC4626Vault(IERC20(address(asset)), address(this), 100_000_000e18, 1000, address(this));
+        strategy = new LendingStrategy(address(asset), address(vault), address(this), address(this));
 
         strategy.setLendingPool(address(pool));
         pool.setYieldRecipient(address(strategy));
         vault.setStrategy(address(strategy));
 
+        address[3] memory actorList = [alice, bob, carol];
+        for (uint256 i; i < actorList.length; ++i) {
+            asset.mint(actorList[i], INITIAL_BALANCE);
+        }
+
+        // Seed the vault so the fuzzer does not spend its budget re-testing the empty-vault branch.
+        asset.mint(address(this), 10_000e18);
+        asset.approve(address(vault), type(uint256).max);
+        vault.deposit(10_000e18, address(this));
+
         address[] memory actors = new address[](3);
         actors[0] = alice;
         actors[1] = bob;
         actors[2] = carol;
-        for (uint256 i = 0; i < actors.length; ++i) {
-            asset.mint(actors[i], 1_000_000e18);
-        }
-
         handler = new VaultHandler(vault, asset, pool, strategy, actors);
+
         targetContract(address(handler));
-
-        bytes4[] memory selectors = new bytes4[](7);
-        selectors[0] = VaultHandler.deposit.selector;
-        selectors[1] = VaultHandler.mint.selector;
-        selectors[2] = VaultHandler.withdraw.selector;
-        selectors[3] = VaultHandler.redeem.selector;
-        selectors[4] = VaultHandler.harvest.selector;
-        selectors[5] = VaultHandler.simulateYield.selector;
-        selectors[6] = VaultHandler.warp.selector;
-        targetSelector(FuzzSelector({ addr: address(handler), selectors: selectors }));
     }
 
-    /// @notice `totalAssets()` must always be exactly the sum of the tracked idle and debt buckets.
+    /// @notice The accounting identity the whole design rests on.
     function invariant_TotalAssetsEqualsIdlePlusDebt() public view {
-        assertEq(vault.totalAssets(), vault.totalIdle() + vault.totalDebt(), "accounting identity broken");
+        assertEq(vault.totalAssets(), vault.totalIdle() + vault.totalDebt(), "totalAssets != totalIdle + totalDebt");
     }
 
-    /// @notice The vault must always hold enough assets to cover every outstanding share, and the
-    ///         strategy debt must never exceed what the strategy actually has.
+    /// @notice The vault must never claim more debt than the strategy actually holds.
+    ///
+    /// @dev Skipped once a loss is simulated. A loss is reported through `harvest`, so between the
+    ///      loss occurring and the next harvest the vault's nominal `totalDebt` legitimately exceeds
+    ///      the strategy's real assets. That window is the point of the report mechanism, not a
+    ///      violation — asserting through it would demand the vault read the strategy's live balance
+    ///      on every call, which is exactly the design this project rejects.
     function invariant_VaultNeverInsolvent() public view {
         assertGe(vault.totalAssets(), vault.totalDebt(), "debt exceeds total assets");
+
+        if (handler.ghostLossSimulated()) return;
 
         address current = vault.strategy();
         if (current != address(0)) {
@@ -219,16 +241,46 @@ contract InvariantTest is Test {
         }
     }
 
-    /// @notice Without simulated losses, the sum of what users put in must be fully covered: the vault
-    ///         can never owe less than the net principal it took.
-    function invariant_SharesNeverWorthLessThanDeposited() public view {
+    /// @notice The handler's share ledger must equal the sum of the actors' real balances.
+    ///
+    /// @dev This is the exact form of "shares are not minted or burned behind a user's back". It has
+    ///      no tolerance because share counts are integers that the vault either reports correctly
+    ///      or does not: any discrepancy is a bug, not rounding.
+    function invariant_HandlerShareLedgerMatchesVault() public view {
+        assertEq(
+            handler.ghostTotalShares(),
+            handler.vaultShareBalanceSum(),
+            "handler share ledger diverged from actual balances"
+        );
+    }
+
+    /// @notice Without a simulated loss, the share price never falls below its recorded peak.
+    ///
+    /// @dev `convertToAssets(1e18)` is the canonical share price. Deposits, withdrawals and harvests
+    ///      must never move it down: deposits round shares down (price unchanged or up), withdrawals
+    ///      round assets down (unchanged or up), and a profitable harvest raises it. A decrease means
+    ///      value leaked from holders to someone else.
+    function invariant_SharePriceNeverDrops() public view {
         if (handler.ghostLossSimulated()) return;
 
-        uint256 owedToUsers = vault.convertToAssets(vault.totalSupply() - vault.balanceOf(vault.DEAD_ADDRESS()));
-        assertGe(vault.totalAssets(), handler.ghostTotalNetDeposited(), "principal not covered");
-        // Every outstanding user share must be redeemable for at least what the fuzzer recorded as net
-        // principal, minus the dust held by the dead address and virtual shares.
-        assertGe(owedToUsers + 1e6, handler.ghostTotalNetDeposited(), "shares worth less than net deposits");
+        uint256 price = vault.convertToAssets(1e18);
+        assertGe(price, handler.ghostPeakPricePerShare(), "share price dropped without a reported loss");
+    }
+
+    /// @notice The vault never pays out more than went in.
+    ///
+    /// @dev There are exactly three ways assets enter the vault in this handler: a deposit, a mint,
+    ///      or simulated yield earned by the strategy. If cumulative withdrawals ever exceed
+    ///      deposits + yield, the vault is paying out money it never received. The yield term is
+    ///      what makes this an honest solvency check rather than a tautology that only holds while
+    ///      no interest accrues.
+    function invariant_WithdrawalsNeverExceedInflows() public view {
+        if (handler.ghostLossSimulated()) return;
+        assertLe(
+            handler.ghostTotalAssetsOut(),
+            handler.ghostTotalAssetsPaid() + handler.ghostTotalYieldInjected(),
+            "withdrew more than was deposited plus earned"
+        );
     }
 
     /// @notice The share supply can never be zero while the vault holds assets.
@@ -236,5 +288,10 @@ contract InvariantTest is Test {
         if (vault.totalAssets() > 0) {
             assertGt(vault.totalSupply(), 0, "assets without shares");
         }
+    }
+
+    /// @notice The dead-share floor is never violated: 0xdEaD keeps at least DEAD_SHARES forever.
+    function invariant_DeadSharesNeverBurned() public view {
+        assertGe(vault.balanceOf(vault.DEAD_ADDRESS()), vault.DEAD_SHARES(), "dead shares were removed");
     }
 }
