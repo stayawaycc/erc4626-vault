@@ -1,0 +1,42 @@
+# Foundry build artefacts
+out/
+cache/
+broadcast/
+
+# Deployment records. The local chain JSON is tracked on purpose: Anvil starts from a fixed nonce
+# for account #0, so a fresh node always reproduces the same addresses. That makes the committed
+# 31337.json valid for anyone running `npm run dev:all`, and keeps `npm run build` working without
+# a prior deploy. Other chains stay untracked.
+deployments/*.json
+!deployments/31337.json
+
+# Secrets
+.env
+.env.*
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Coverage
+lcov.info
+coverage/
+coverage.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local toolchain binaries (never commit these)
+.toolchain/
+
+# NOTE: lib/ is intentionally NOT ignored. Dependencies are committed as git submodules so that
+# `git clone --recursive` gives a repository that builds and tests without any extra step.
