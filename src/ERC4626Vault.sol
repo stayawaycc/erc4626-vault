@@ -66,6 +66,10 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
     /// @notice Advisory delay after which keeper bots should harvest again.
     uint256 public maxReportDelay;
 
+    /// @notice Address allowed to call {harvest} in addition to the owner.
+    /// @dev Gating harvest is what closes the atomic sandwich on unreported yield. See {harvest}.
+    address public keeper;
+
     error Vault__ZeroAddress();
     error Vault__ZeroAmount();
     error Vault__NotStrategy(address caller);
@@ -79,6 +83,7 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
     error Vault__CannotSweepAsset();
     error Vault__NothingToSweep();
     error Vault__ZeroDelay();
+    error Vault__NotKeeper(address caller);
 
     event StrategyUpdated(address indexed previousStrategy, address indexed newStrategy);
     event DepositLimitUpdated(uint256 previousLimit, uint256 newLimit);
@@ -87,6 +92,7 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
     event MaxReportDelayUpdated(uint256 previousDelay, uint256 newDelay);
     event Reported(uint256 profit, uint256 loss, uint256 feeShares, uint256 totalDebt, uint256 totalIdle);
     event Swept(address indexed token, address indexed receiver, uint256 amount);
+    event KeeperUpdated(address indexed previousKeeper, address indexed newKeeper);
 
     constructor(IERC20 asset_, address owner_, uint256 depositLimit_, uint256 performanceFee_, address feeRecipient_)
         ERC4626(asset_)
@@ -101,11 +107,13 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
         performanceFee = performanceFee_;
         feeRecipient = feeRecipient_;
         maxReportDelay = 7 days;
+        keeper = owner_;
 
         emit DepositLimitUpdated(0, depositLimit_);
         emit PerformanceFeeUpdated(0, performanceFee_);
         emit FeeRecipientUpdated(address(0), feeRecipient_);
         emit MaxReportDelayUpdated(0, maxReportDelay);
+        emit KeeperUpdated(address(0), keeper);
     }
 
     // ---------------------------------------------------------------------
@@ -152,6 +160,18 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
     function maxDeposit(address) public view override(ERC4626, IERC4626) returns (uint256) {
         uint256 assets = totalAssets();
         return assets >= depositLimit ? 0 : depositLimit - assets;
+    }
+
+    /// @inheritdoc IERC4626
+    /// @dev Overriding this is not optional. OZ's default returns `type(uint256).max`, and
+    ///      `ERC4626.mint` checks its argument against *this* function, not against `maxDeposit`.
+    ///      Leaving it unoverridden made `depositLimit` decorative: any caller could `mint` past the
+    ///      cap, and a `depositLimit` of 0 (documented as the emergency stop) still allowed deposits
+    ///      through `mint`. See `test_MintBypassesDepositLimit`.
+    function maxMint(address) public view override(ERC4626, IERC4626) returns (uint256) {
+        uint256 assets = totalAssets();
+        if (assets >= depositLimit) return 0;
+        return _convertToShares(depositLimit - assets, Math.Rounding.Floor);
     }
 
     /// @inheritdoc IERC4626
@@ -226,10 +246,21 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
     // ---------------------------------------------------------------------
 
     /// @notice Harvests the active strategy and books the resulting profit/loss.
-    /// @dev Permissionless on purpose: any keeper bot may trigger it, the strategy itself is the one
-    ///      that authenticates the caller. Not guarded because {report} is invoked from inside the
-    ///      strategy call chain and both share this contract's reentrancy guard.
-    function harvest() external override(IVault) returns (uint256 profit) {
+    /// @dev Restricted to the keeper or owner.
+    ///
+    ///      It used to be permissionless on the theory that "anyone may poke it". That is unsafe
+    ///      for a vault whose `totalAssets()` excludes unreported yield: a stranger could deposit at
+    ///      the pre-yield price, call `harvest` themselves, and redeem at the post-yield price, all
+    ///      inside one transaction. Measured on the 10_000 deposit / 1_000 yield case, the attacker
+    ///      extracted 810 of the 909 that belonged to the existing holder. The mirror case is worse:
+    ///      an unreported loss can be front-run, letting the attacker exit at full price while the
+    ///      remaining holder absorbs the entire loss. See `test_UnharvestedYieldCanBeSandwiched`.
+    ///
+    ///      Gating the caller removes the atomic version of the attack. It does not remove the
+    ///      economic one — a keeper can still front-run — so the trust model now explicitly includes
+    ///      the keeper, which is the standard trade-off for this vault shape.
+    function harvest() external override(IVault) nonReentrant returns (uint256 profit) {
+        if (msg.sender != keeper && msg.sender != owner()) revert Vault__NotKeeper(msg.sender);
         address current = strategy;
         if (current == address(0)) revert Vault__NoStrategy();
         _syncIdle();
@@ -321,6 +352,13 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
         maxReportDelay = newDelay;
     }
 
+    /// @notice Sets the address allowed to call {harvest} alongside the owner.
+    function setKeeper(address newKeeper) external onlyOwner {
+        if (newKeeper == address(0)) revert Vault__ZeroAddress();
+        emit KeeperUpdated(keeper, newKeeper);
+        keeper = newKeeper;
+    }
+
     /// @notice Rescues tokens that are not the vault asset.
     function sweep(address token) external onlyOwner nonReentrant {
         if (token == address(0)) revert Vault__ZeroAddress();
@@ -374,13 +412,27 @@ contract ERC4626Vault is ERC4626, Ownable, ReentrancyGuard, IVault {
         totalDebt += invested;
     }
 
-    /// @dev Pulls the whole debt back from the strategy, tolerating partial fills.
+    /// @dev Pulls everything the strategy holds back into the vault, tolerating partial fills.
+    ///
+    ///      It withdraws `max(totalDebt, strategy.totalAssets())`, not just `totalDebt`. Pulling only
+    ///      the debt leaves any unreported profit behind, and once the strategy is detached it can no
+    ///      longer report (`report` checks `msg.sender == strategy`), so that profit becomes
+    ///      unreachable through the vault. Measured: a 500 profit on a 10_000 deposit was stranded
+    ///      in the old strategy after a migration. See `test_SetStrategyStrandsUnharvestedProfit`.
+    ///
+    ///      The extra `strategy.totalAssets()` call is a staticcall to a contract the owner chose;
+    ///      if it lies the migration is the owner's problem, which is the same trust boundary
+    ///      `setStrategy` already sits behind.
     function _divestAll() internal {
         address current = strategy;
-        uint256 debt = totalDebt;
-        if (current == address(0) || debt == 0) return;
+        if (current == address(0)) return;
 
-        uint256 received = IStrategy(current).withdraw(debt, address(this));
+        uint256 debt = totalDebt;
+        uint256 held = IStrategy(current).totalAssets();
+        uint256 target = held > debt ? held : debt;
+        if (target == 0) return;
+
+        uint256 received = IStrategy(current).withdraw(target, address(this));
         totalDebt = received >= debt ? 0 : debt - received;
         totalIdle += received;
     }

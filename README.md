@@ -131,7 +131,7 @@ npm run dev:all      # anvil:8546 → deploy → vite:5174
 一条命令 `forge test` 的真实输出：
 
 ```
-Ran 5 test suites in 6.80s: 109 tests passed, 0 failed, 0 skipped (109 total tests)
+Ran 6 test suites in 2.61s: 146 tests passed, 0 failed, 0 skipped (146 total tests)
 ```
 
 | 套件 | 用例数 | 结果 |
@@ -139,8 +139,9 @@ Ran 5 test suites in 6.80s: 109 tests passed, 0 failed, 0 skipped (109 total tes
 | `test/ERC4626Vault.t.sol` | 55 | 全部通过（含 3 个 fuzz，每个 512 runs） |
 | `test/Strategy.t.sol` | 27 | 全部通过 |
 | `test/Invariant.t.sol` | 7 | 全部通过（每个 128 runs × 4096 calls，0 reverts） |
-| `test/Audit.t.sol` + `test/AuditDeep.t.sol` | 20 | 对抗性探针：通胀攻击成本、会计恒等式、全员退出、舍入方向、费用复利、上限、sweep 越权 |
-| **合计** | **109** | **100% 通过** |
+| `test/Audit.t.sol` | 38 | 对抗性探针：mint 绕过上限、harvest 三明治、setStrategy 遗弃利润、report 信任边界、mock 杠杆无权限 |
+| `test/AuditDeep.t.sol` + `test/VerifyVault.t.sol` | 11 + 8 | 深度会计探针与修复回归 |
+| **合计** | **146** | **100% 通过** |
 
 不变量测试的不变量清单：
 
